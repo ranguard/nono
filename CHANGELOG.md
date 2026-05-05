@@ -1,5 +1,112 @@
 # Changelog
 
+## [0.46.0] - 2026-05-01
+
+### Bug Fixes
+
+- *(policy)* Add XDG_STATE_HOME nix profiles path to nix_runtime group
+
+- *(policy)* Make nix_runtime group cross-platform
+
+- *(cli)* Re-validate deny overlaps after all grants
+
+- Update examples in setup.rs
+
+
+### Features
+
+- *(network)* Support GitLab developer domains
+
+
+### Testing
+
+- *(cli-tests)* Add workdir access to deny overlap test
+
+- Exclude system_write_linux in post-CWD overlap regression test
+
+## [0.45.0] - 2026-04-30
+
+### Features
+
+- *(packages)* Use native tls root certificates
+- *(ux)* Warn on macOS when `--allow` targets a path blocked by a deny group (e.g. `deny_credentials`), suggesting `--override-deny`
+
+## [0.44.0] - 2026-04-29
+
+### Bug Fixes
+
+- *(package)* Harden re-pulls against user edits
+
+- *(wiring)* Harden install and uninstall wiring
+
+
+### Features
+
+- *(claude)* Detect and remove pre-0.43 inbuilt hook leftovers (`~/.claude/hooks/nono-hook.sh` and matching `settings.json::hooks` entry) on first
+   claude pack install/resolve, with a confirmation prompt and a per-item summary
+- *(profile, migration)* Move codex, claude-code to registry pack
+
+
+### Miscellaneous
+
+- *(ci)* Improve ci stability and profile test coverage
+
+
+### Refactoring
+
+- *(wiring)* Simplify string expansion
+
+## [0.43.1] - 2026-04-29
+
+### Bug Fixes
+
+- *(cli)* Char-aware truncation in truncate_command
+
+## [0.43.0] - 2026-04-28
+
+### Bug Fixes
+
+- *(cli)* Fail fast on --allow-connect-port on macOS
+
+- Set system-keyring as default feature for backward compatibility
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.2 to 1.16.3
+
+- *(deps)* Bump hyper from 1.8.1 to 1.9.0
+
+
+### Features
+
+- *(cli)* Add --allow-connect-port for outbound TCP port allowlisting
+
+- Make system keyring optional for headless/container builds
+
+
+### Style
+
+- Run cargo fmt
+
+## [0.42.0] - 2026-04-25
+
+### Bug Fixes
+
+- *(proxy)* Stop adding allow_domain hosts to NO_PROXY without direct TCP grants
+
+
+### Documentation
+
+- Add --allow-unix-socket* flags and profile fields
+
+
+### Features
+
+- *(cli)* Add --allow-unix-socket flag family + profile schema
+
+- *(capability)* Add UnixSocketCapability and UnixSocketMode
+
 ## [0.41.0] - 2026-04-24
 
 ### Bug Fixes

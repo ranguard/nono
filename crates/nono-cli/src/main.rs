@@ -12,17 +12,21 @@ mod capability_ext;
 mod cli;
 mod cli_bootstrap;
 mod command_blocking_deprecation;
+mod command_display;
 mod command_runtime;
 mod config;
 mod credential_runtime;
 mod deprecated_policy;
+mod deprecated_schema;
+mod deprecation_warnings;
 mod exec_strategy;
 mod execution_runtime;
-mod hooks;
 mod instruction_deny;
 mod launch_runtime;
 mod learn;
 mod learn_runtime;
+mod legacy_cleanup;
+mod migration;
 mod network_policy;
 mod open_url_runtime;
 mod output;
@@ -36,6 +40,7 @@ mod profile_save_runtime;
 mod protected_paths;
 mod proxy_runtime;
 mod pty_proxy;
+mod pull_ui;
 mod query_ext;
 mod registry_client;
 mod rollback_commands;
@@ -60,6 +65,7 @@ mod trust_keystore;
 mod trust_scan;
 mod update_check;
 mod why_runtime;
+mod wiring;
 
 #[cfg(test)]
 mod test_env;
@@ -87,6 +93,11 @@ pub(crate) use proxy_runtime::merge_dedup_ports;
 fn main() {
     let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
+    // Emit one deprecation warning per distinct legacy long flag before clap
+    // parses. clap's `alias` rebinds `--override-deny` to `--bypass-protection`
+    // silently; without this scan the user would never see a removal notice.
+    let os_args: Vec<_> = std::env::args_os().collect();
+    deprecated_schema::warn_for_deprecated_flags(&os_args);
     let cli = Cli::parse();
     init_tracing(&cli);
     init_theme(&cli);
@@ -95,6 +106,15 @@ fn main() {
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
+        // User-initiated stops (declined prompt, non-TTY without
+        // NONO_AUTO_MIGRATE) are surfaced as `NonoError::Cancelled`.
+        // Their stderr message has already been printed at the call
+        // site — exit non-zero but skip the ERROR log and the
+        // duplicated `nono:` prefix so the output reads as an
+        // intentional stop, not a fault.
+        if matches!(e, nono::NonoError::Cancelled(_)) {
+            std::process::exit(1);
+        }
         error!("{}", e);
         eprintln!("nono: {}", e);
         std::process::exit(1);
@@ -225,7 +245,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
-            override_deny_paths: Vec::new(),
+            bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
         };
 
@@ -268,7 +288,7 @@ mod tests {
             allow_gpu_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
-            override_deny_paths: Vec::new(),
+            bypass_protection_paths: Vec::new(),
             allowed_env_vars: None,
         };
 

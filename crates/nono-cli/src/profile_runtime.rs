@@ -1,5 +1,5 @@
 use crate::cli::SandboxArgs;
-use crate::{hooks, package, profile};
+use crate::{package, profile};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_launch_services: bool,
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
-    pub(crate) override_deny_paths: Vec<PathBuf>,
+    pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
@@ -34,38 +34,21 @@ struct PrepareProfileOptions {
     hook_output_silent: bool,
 }
 
-fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
+fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
+    // In-binary hook installation was removed in v0.44.0 alongside
+    // the hooks.rs module. Profiles that ship a `hooks.<target>`
+    // block are surfaced as a one-line note; the actual wiring
+    // belongs in the pack's `wiring` directives now.
     if profile.hooks.hooks.is_empty() {
         return;
     }
-
-    match hooks::install_profile_hooks(profile_name, &profile.hooks.hooks) {
-        Ok(results) => {
-            for (target, result) in results {
-                match result {
-                    hooks::HookInstallResult::Installed => {
-                        if !silent {
-                            eprintln!(
-                                "  Installing {} hook to ~/.claude/hooks/nono-hook.sh",
-                                target
-                            );
-                        }
-                    }
-                    hooks::HookInstallResult::Updated => {
-                        if !silent {
-                            eprintln!("  Updating {} hook (new version available)", target);
-                        }
-                    }
-                    hooks::HookInstallResult::AlreadyInstalled
-                    | hooks::HookInstallResult::Skipped => {}
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to install profile hooks: {}", e);
-            if !silent {
-                eprintln!("  Warning: Failed to install hooks: {}", e);
-            }
+    if !silent {
+        for target in profile.hooks.hooks.keys() {
+            eprintln!(
+                "  Note: profile declares hooks.{target} but in-profile hook \
+                 installation has been removed; move the wiring into the pack's \
+                 package.json `wiring` directives."
+            );
         }
     }
 }
@@ -232,7 +215,7 @@ fn verify_stored_bundles(
     Ok(())
 }
 
-fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
+fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {
     let path_str = path.to_string_lossy();
     let expanded = profile::expand_vars(&path_str, workdir).unwrap_or_else(|_| path.to_path_buf());
     if expanded.exists() {
@@ -242,16 +225,16 @@ fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
     }
 }
 
-fn collect_override_deny_paths(
+fn collect_bypass_protection_paths(
     loaded_profile: Option<&profile::Profile>,
-    cli_override_deny: &[PathBuf],
+    cli_bypass_protection: &[PathBuf],
     workdir: &Path,
 ) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = loaded_profile
         .map(|profile| {
             profile
-                .policy
-                .override_deny
+                .filesystem
+                .bypass_protection
                 .iter()
                 .filter_map(|template| {
                     profile::expand_vars(template, workdir)
@@ -268,8 +251,8 @@ fn collect_override_deny_paths(
         })
         .unwrap_or_default();
 
-    for path in cli_override_deny {
-        let canonical = expand_override_deny_path(path, workdir);
+    for path in cli_bypass_protection {
+        let canonical = expand_bypass_protection_path(path, workdir);
         if !paths.contains(&canonical) {
             paths.push(canonical);
         }
@@ -283,7 +266,25 @@ fn prepare_profile_with_options(
     workdir: &Path,
     options: PrepareProfileOptions,
 ) -> crate::Result<PreparedProfile> {
+    // Ensure the user-profile dir exists before the sandbox is built.
+    // It's a nono-managed location that profiles routinely reference
+    // in `filesystem.allow` (so a sandboxed agent can write extension
+    // profiles there following hook guidance), but Landlock can't
+    // mkdir a path that's only granted by name — the parent needs
+    // write permission. Pre-creating here means the leaf grant is
+    // sufficient. Best-effort: a permission error here just means the
+    // sandbox will deny writes the same as before.
+    if let Ok(config_dir) = profile::resolve_user_config_dir() {
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        if !profiles_dir.exists() {
+            let _ = std::fs::create_dir_all(&profiles_dir);
+        }
+    }
+
     let loaded_profile = if let Some(ref profile_name) = args.profile {
+        // The claude-code → registry-pack migration is wired into
+        // `load_profile` itself so it fires from every call site (run,
+        // wrap, shell, profile show, why, learn) without duplication.
         let profile = profile::load_profile(profile_name)?;
         verify_profile_packs(&profile.packs)?;
 
@@ -371,9 +372,9 @@ fn prepare_profile_with_options(
             .as_ref()
             .and_then(|profile| profile.allow_parent_of_protected)
             .unwrap_or(false),
-        override_deny_paths: collect_override_deny_paths(
+        bypass_protection_paths: collect_bypass_protection_paths(
             loaded_profile.as_ref(),
-            &args.override_deny,
+            &args.bypass_protection,
             workdir,
         ),
         allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
@@ -449,8 +450,8 @@ mod tests {
                     "upstream_bypass": ["localhost"],
                     "listen_port": [8080]
                 },
-                "policy": {
-                    "override_deny": ["$WORKDIR/.git"]
+                "filesystem": {
+                    "bypass_protection": ["$WORKDIR/.git"]
                 }
             }"#,
         ) {
@@ -459,7 +460,7 @@ mod tests {
 
         let args = SandboxArgs {
             profile: Some(profile_path.to_string_lossy().into_owned()),
-            override_deny: vec![cli_override],
+            bypass_protection: vec![cli_override],
             ..SandboxArgs::default()
         };
 
@@ -501,13 +502,16 @@ mod tests {
             preflight.allow_launch_services
         );
         assert_eq!(runtime.allow_gpu, preflight.allow_gpu);
-        assert_eq!(runtime.override_deny_paths, preflight.override_deny_paths);
+        assert_eq!(
+            runtime.bypass_protection_paths,
+            preflight.bypass_protection_paths
+        );
         assert_eq!(
             runtime.loaded_profile.as_ref().map(|profile| {
                 (
                     profile.meta.name.clone(),
                     profile.extends.clone(),
-                    profile.security.groups.clone(),
+                    profile.groups.include.clone(),
                     profile.workdir.access.clone(),
                     profile.filesystem.allow.clone(),
                 )
@@ -516,7 +520,7 @@ mod tests {
                 (
                     profile.meta.name.clone(),
                     profile.extends.clone(),
-                    profile.security.groups.clone(),
+                    profile.groups.include.clone(),
                     profile.workdir.access.clone(),
                     profile.filesystem.allow.clone(),
                 )

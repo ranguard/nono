@@ -208,7 +208,9 @@
           "/etc/nsswitch.conf",
           "/etc/gai.conf",
           "/etc/ssl",
+          "/etc/pki",
           "/etc/ca-certificates",
+          "/etc/crypto-policies",
           "/etc/ld.so.cache",
           "/etc/ld.so.conf",
           "/etc/ld.so.conf.d",
@@ -482,11 +484,13 @@
     },
     "nix_runtime": {
       "description": "Nix package manager runtime paths",
-      "platform": "linux",
       "allow": {
         "read": [
           "~/.nix-profile",
+          "~/.local/state/nix/profile",
+          "~/.local/state/nix/profiles",
           "~/.nix-defexpr",
+          "~/.local/state/nix/defexpr",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
           "/nix/var/nix/profiles",
@@ -594,8 +598,8 @@
         "description": "Default conservative base profile",
         "author": "nono-project"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "deny_credentials",
           "deny_keychains_macos",
           "deny_keychains_linux",
@@ -614,7 +618,9 @@
           "dangerous_commands",
           "dangerous_commands_macos",
           "dangerous_commands_linux"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -630,161 +636,20 @@
         "description": "Linux compatibility profile for host runtime, sysfs, and temp access",
         "author": "nono-project"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "linux_runtime_state",
           "linux_sysfs_read",
           "linux_temp_read"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated"
       },
       "filesystem": {},
       "network": { "block": false },
       "workdir": { "access": "none" },
       "interactive": false
-    },
-    "claude-code": {
-      "extends": "default",
-      "meta": {
-        "name": "claude-code",
-        "version": "1.0.0",
-        "description": "Anthropic Claude Code CLI agent",
-        "author": "nono-project"
-      },
-      "security": {
-        "groups": [
-          "claude_code_macos",
-          "claude_code_linux",
-          "user_caches_macos",
-          "claude_cache_linux",
-          "node_runtime",
-          "rust_runtime",
-          "python_runtime",
-          "vscode_macos",
-          "vscode_linux",
-          "linux_sysfs_read",
-          "nix_runtime",
-          "git_config",
-          "unlink_protection"
-        ],
-        "signal_mode": "isolated",
-        "capability_elevation": false
-      },
-      "filesystem": {
-        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$XDG_CONFIG_HOME/nono/profiles"],
-        "allow_file": [
-          "$HOME/.claude.json",
-          "$HOME/.claude.json.lock",
-          "$HOME/.claude.lock"
-        ]
-      },
-      "policy": {
-        "add_allow_readwrite": [
-          "$HOME/Library/Keychains"
-        ],
-        "override_deny": [
-          "$HOME/Library/Keychains"
-        ]
-      },
-      "network": { "block": false },
-      "workdir": { "access": "readwrite" },
-      "open_urls": {
-        "allow_origins": [
-          "https://claude.ai"
-        ],
-        "allow_localhost": true
-      },
-      "allow_launch_services": true,
-      "undo": {
-        "exclude_patterns": ["node_modules", ".next", "__pycache__", "target"],
-        "exclude_globs": ["*.tmp.[0-9]*.[0-9]*"]
-      },
-      "interactive": true
-    },
-    "claude-no-kc": {
-      "extends": "default",
-      "meta": {
-        "name": "claude-no-kc",
-        "version": "1.0.0",
-        "description": "Anthropic Claude Code CLI agent without macOS keychain access",
-        "author": "nono-project"
-      },
-      "security": {
-        "groups": [
-          "claude_code_linux",
-          "user_caches_macos",
-          "claude_cache_linux",
-          "node_runtime",
-          "rust_runtime",
-          "python_runtime",
-          "vscode_macos",
-          "vscode_linux",
-          "linux_sysfs_read",
-          "nix_runtime",
-          "git_config",
-          "unlink_protection"
-        ],
-        "signal_mode": "isolated",
-        "capability_elevation": false
-      },
-      "filesystem": {
-        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$XDG_CONFIG_HOME/nono/profiles"],
-        "allow_file": [
-          "$HOME/.claude.json",
-          "$HOME/.claude.json.lock",
-          "$HOME/.claude.lock"
-        ]
-      },
-      "network": { "block": false },
-      "workdir": { "access": "readwrite" },
-      "open_urls": {
-        "allow_origins": [
-          "https://claude.ai"
-        ],
-        "allow_localhost": true
-      },
-      "allow_launch_services": true,
-      "undo": {
-        "exclude_patterns": ["node_modules", ".next", "__pycache__", "target"],
-        "exclude_globs": ["*.tmp.[0-9]*.[0-9]*"]
-      },
-      "interactive": true
-    },
-    "codex": {
-      "extends": "default",
-      "meta": {
-        "name": "codex",
-        "version": "1.0.0",
-        "description": "OpenAI Codex CLI agent",
-        "author": "nono-project"
-      },
-      "security": {
-        "groups": [
-          "codex_macos",
-          "node_runtime",
-          "rust_runtime",
-          "python_runtime",
-          "linux_sysfs_read",
-          "nix_runtime",
-          "git_config",
-          "unlink_protection"
-        ],
-        "signal_mode": "isolated",
-        "capability_elevation": false
-      },
-      "filesystem": {
-        "allow": ["$HOME/.codex"]
-      },
-      "open_urls": {
-        "allow_origins": [
-          "https://auth.openai.com"
-        ],
-        "allow_localhost": true
-      },
-      "allow_launch_services": true,
-      "network": { "block": false },
-      "workdir": { "access": "readwrite" },
-      "interactive": true
     },
     "openclaw": {
       "extends": "default",
@@ -794,8 +659,10 @@
         "description": "OpenClaw messaging gateway",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["node_runtime"]
+      },
       "security": {
-        "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {
@@ -820,8 +687,10 @@
         "description": "OpenCode AI coding assistant",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"]
+      },
       "security": {
-        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "linux_sysfs_read", "git_config", "unlink_protection"],
         "signal_mode": "isolated"
       },
       "filesystem": {
@@ -850,8 +719,10 @@
         "description": "Python SDK development profile with pyenv, conda, and pip support",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["python_runtime"]
+      },
       "security": {
-        "groups": ["python_runtime"],
         "signal_mode": "isolated",
         "ipc_mode": "full"
       },
@@ -868,8 +739,10 @@
         "description": "Node.js SDK development profile with nvm, fnm, pnpm, and npm support",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["node_runtime"]
+      },
       "security": {
-        "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -885,8 +758,10 @@
         "description": "Go SDK development profile with GOPATH and module support",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["go_runtime"]
+      },
       "security": {
-        "groups": ["go_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -902,8 +777,10 @@
         "description": "Rust SDK development profile with cargo and rustup support",
         "author": "nono-project"
       },
+      "groups": {
+        "include": ["rust_runtime"]
+      },
       "security": {
-        "groups": ["rust_runtime"],
         "signal_mode": "isolated"
       },
       "filesystem": {},
@@ -919,8 +796,8 @@
         "description": "Swival CLI coding agent",
         "author": "nono-project"
       },
-      "security": {
-        "groups": [
+      "groups": {
+        "include": [
           "python_runtime",
           "node_runtime",
           "user_caches_macos",
@@ -928,7 +805,9 @@
           "linux_sysfs_read",
           "git_config",
           "unlink_protection"
-        ],
+        ]
+      },
+      "security": {
         "signal_mode": "isolated",
         "capability_elevation": false
       },

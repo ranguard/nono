@@ -71,12 +71,12 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         )));
     }
 
-    // Validate --extends target exists
+    // Validate --extends target exists in any of the three sources the
+    // resolver knows about (user dir, pack store, built-in).
     if let Some(ref base) = args.extends {
         if !profile_exists(base) {
-            return Err(NonoError::ProfileParse(format!(
-                "Base profile '{}' not found (built-in or user profile)",
-                base
+            return Err(NonoError::ProfileParse(extends_target_not_found_message(
+                base,
             )));
         }
     }
@@ -163,15 +163,27 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     }
     root.insert("meta".to_string(), serde_json::Value::Object(meta));
 
-    // security
-    let mut security = serde_json::Map::new();
-    let groups: Vec<serde_json::Value> = args
+    // groups (canonical: top-level include/exclude pair)
+    let mut groups = serde_json::Map::new();
+    let include: Vec<serde_json::Value> = args
         .groups
         .iter()
         .map(|g| serde_json::Value::String(g.clone()))
         .collect();
-    security.insert("groups".to_string(), serde_json::Value::Array(groups));
-    root.insert("security".to_string(), serde_json::Value::Object(security));
+    groups.insert("include".to_string(), serde_json::Value::Array(include));
+    if args.full {
+        groups.insert("exclude".to_string(), serde_json::Value::Array(vec![]));
+    }
+    root.insert("groups".to_string(), serde_json::Value::Object(groups));
+
+    // commands (only included with --full; allow/deny are deprecated since
+    // v0.33.0 but remain the canonical home for command gating until removed).
+    if args.full {
+        let mut commands = serde_json::Map::new();
+        commands.insert("allow".to_string(), serde_json::Value::Array(vec![]));
+        commands.insert("deny".to_string(), serde_json::Value::Array(vec![]));
+        root.insert("commands".to_string(), serde_json::Value::Object(commands));
+    }
 
     // workdir
     let mut workdir = serde_json::Map::new();
@@ -181,7 +193,9 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     );
     root.insert("workdir".to_string(), serde_json::Value::Object(workdir));
 
-    // filesystem (minimal has allow + read; full adds all fields)
+    // filesystem (minimal has allow + read; full adds all fields, including
+    // the canonical replacements for the legacy `policy` patch keys —
+    // see deprecated_schema.rs for the migration mapping).
     let mut filesystem = serde_json::Map::new();
     filesystem.insert("allow".to_string(), serde_json::Value::Array(vec![]));
     filesystem.insert("read".to_string(), serde_json::Value::Array(vec![]));
@@ -190,6 +204,11 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
         filesystem.insert("allow_file".to_string(), serde_json::Value::Array(vec![]));
         filesystem.insert("read_file".to_string(), serde_json::Value::Array(vec![]));
         filesystem.insert("write_file".to_string(), serde_json::Value::Array(vec![]));
+        filesystem.insert("deny".to_string(), serde_json::Value::Array(vec![]));
+        filesystem.insert(
+            "bypass_protection".to_string(),
+            serde_json::Value::Array(vec![]),
+        );
     }
     root.insert(
         "filesystem".to_string(),
@@ -198,38 +217,6 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
 
     // Full skeleton adds additional sections
     if args.full {
-        // policy
-        let mut pol = serde_json::Map::new();
-        pol.insert(
-            "exclude_groups".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_read".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_write".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_allow_readwrite".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_deny_access".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "add_deny_commands".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        pol.insert(
-            "override_deny".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        root.insert("policy".to_string(), serde_json::Value::Object(pol));
-
         // network
         // NOTE: network_profile is intentionally omitted. Emitting null would
         // clear an inherited proxy profile (e.g., "developer" from python-dev),
@@ -280,17 +267,32 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     serde_json::Value::Object(root)
 }
 
-/// Check if a profile exists (built-in or user).
+/// Check if a profile exists (built-in, user, or pack-provided).
+///
+/// Mirrors the resolver in `profile::load_profile_inner`: user dir →
+/// pack-store → built-in. Without the pack-store check, formerly-builtin
+/// profiles that have moved to registry packs (claude-code, codex)
+/// would falsely fail `nono profile init --extends <name>` validation
+/// even when `nono profile show <name>` resolves them fine.
 fn profile_exists(name: &str) -> bool {
-    // Check built-in profiles
     if profile::builtin::get_builtin(name).is_some() {
         return true;
     }
-    // Check user profiles
     if let Ok(path) = profile::get_user_profile_path(name) {
-        return path.exists();
+        if path.exists() {
+            return true;
+        }
     }
-    false
+    profile::find_pack_store_profile(name).is_some()
+}
+
+/// Update the validation error so users know all three sources were
+/// considered. Used by `cmd_init`'s `--extends` check.
+fn extends_target_not_found_message(name: &str) -> String {
+    format!(
+        "Base profile '{name}' not found (built-in, user, or installed pack). \
+         If it's provided by a registry pack, run `nono pull <namespace>/<pack>` first."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -615,12 +617,19 @@ fn expand_paths_json(paths: &[String]) -> serde_json::Value {
 /// report the real source accurately.
 fn profile_source(name: &str) -> &'static str {
     let builtin_names = profile::builtin::list_builtin();
+    let is_pack = profile::list_pack_store_profiles()
+        .iter()
+        .any(|(n, _)| n == name);
     if profile::is_user_override(name) {
-        if builtin_names.contains(&name.to_string()) {
+        if is_pack {
+            "user (overrides pack)"
+        } else if builtin_names.contains(&name.to_string()) {
             "user (overrides built-in)"
         } else {
             "user"
         }
+    } else if is_pack {
+        "pack"
     } else if builtin_names.contains(&name.to_string()) {
         "built-in"
     } else {
@@ -631,15 +640,28 @@ fn profile_source(name: &str) -> &'static str {
 pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     let builtin_names = profile::builtin::list_builtin();
     let all_names = profile::list_profiles();
+    // (install_as -> pack ref) for the catalogue. Used to bucket pack
+    // profiles under their own section and surface the providing pack.
+    let pack_profiles: std::collections::HashMap<String, String> =
+        profile::list_pack_store_profiles().into_iter().collect();
 
     let mut builtin_profiles: Vec<(String, Result<Profile>)> = Vec::new();
     let mut user_profiles: Vec<(String, Result<Profile>)> = Vec::new();
+    let mut pack_entries: Vec<(String, String, Result<Profile>)> = Vec::new();
 
     for name in &all_names {
-        let p = profile::load_profile(name);
-        // Categorize by actual source: user overrides of built-in names
-        // go under user section to make shadowing visible.
-        if builtin_names.contains(name) && !profile::is_user_override(name) {
+        // Use the no-migrate loader so listing never triggers an
+        // install prompt for pack-provided profiles whose pack happens
+        // to be installed via the resolver self-heal path.
+        let p = profile::load_profile_no_migrate(name);
+        // Categorize by actual source. Precedence: user override > pack
+        // store > built-in. User overrides of either built-in or pack
+        // names go under user section to make shadowing visible.
+        if profile::is_user_override(name) {
+            user_profiles.push((name.clone(), p));
+        } else if let Some(pack_ref) = pack_profiles.get(name) {
+            pack_entries.push((name.clone(), pack_ref.clone(), p));
+        } else if builtin_names.contains(name) {
             builtin_profiles.push((name.clone(), p));
         } else {
             user_profiles.push((name.clone(), p));
@@ -650,16 +672,19 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let format_entry = |name: &str, result: &Result<Profile>| {
             let source = profile_source(name);
             let extends = profile::load_profile_extends(name).unwrap_or_default();
+            let pack = pack_profiles.get(name).cloned();
             match result {
                 Ok(p) => serde_json::json!({
                     "name": name,
                     "source": source,
+                    "pack": pack,
                     "description": p.meta.description.as_deref().unwrap_or(""),
                     "extends": extends,
                 }),
                 Err(e) => serde_json::json!({
                     "name": name,
                     "source": source,
+                    "pack": pack,
                     "error": format!("{}", e),
                 }),
             }
@@ -668,6 +693,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let arr: Vec<serde_json::Value> = builtin_profiles
             .iter()
             .map(|(n, p)| format_entry(n, p))
+            .chain(pack_entries.iter().map(|(n, _, p)| format_entry(n, p)))
             .chain(user_profiles.iter().map(|(n, p)| format_entry(n, p)))
             .collect();
         println!("{}", to_json(&serde_json::Value::Array(arr))?);
@@ -675,7 +701,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     }
 
     let t = theme::current();
-    let total = builtin_profiles.len() + user_profiles.len();
+    let total = builtin_profiles.len() + pack_entries.len() + user_profiles.len();
     println!("{}: {} profiles", prefix(), total);
 
     if !builtin_profiles.is_empty() {
@@ -683,6 +709,14 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         println!("  {}", theme::fg("Built-in:", t.subtext).bold());
         for (name, result) in &builtin_profiles {
             print_profile_line(name, result, t);
+        }
+    }
+
+    if !pack_entries.is_empty() {
+        println!();
+        println!("  {}", theme::fg("Packs:", t.subtext).bold());
+        for (name, pack_ref, result) in &pack_entries {
+            print_pack_profile_line(name, pack_ref, result, t);
         }
     }
 
@@ -698,6 +732,30 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Like `print_profile_line` but appends the providing pack ref so the
+/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
+    match result {
+        Ok(p) => {
+            let desc = p.meta.description.as_deref().unwrap_or("").to_string();
+            let pack_label = format!("from {pack_ref}");
+            println!(
+                "    {:<16} {:<42} {}",
+                theme::fg(name, t.text).bold(),
+                theme::fg(&desc, t.subtext),
+                theme::fg(&pack_label, t.overlay),
+            );
+        }
+        Err(e) => {
+            println!(
+                "    {:<16} {}",
+                theme::fg(name, t.text).bold(),
+                theme::fg(&format!("[error: {}]", e), t.red),
+            );
+        }
+    }
 }
 
 fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
@@ -728,9 +786,19 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 // nono profile show
 // ---------------------------------------------------------------------------
 
+#[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
+    // Order matters: `load_profile_extends` opens an internal
+    // `WarningSuppressionGuard` for its preview parse, so deprecation
+    // warnings fire only on the subsequent real `load_profile` call —
+    // exactly once per legacy key per file (the design's contract,
+    // line 141). DO NOT swap or merge these two calls without
+    // preserving that suppression scope, or warnings will double-emit.
+    // See the regression test `legacy_all_keys_shows_byte_equal_canonical_equivalent`
+    // in tests/deprecated_schema.rs which asserts the exact 9-warning
+    // count on `legacy_all_keys.json`.
     let raw_extends = profile::load_profile_extends(&args.profile);
-    let profile = profile::load_profile(&args.profile)?;
+    let profile = profile::load_profile_no_migrate(&args.profile)?;
 
     if matches!(args.format, Some(crate::cli::ProfileShowFormat::Manifest)) {
         let workdir = std::env::current_dir().map_err(|e| {
@@ -772,22 +840,22 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         );
     }
 
-    // Security groups
-    if !profile.security.groups.is_empty() {
+    // Security groups (resolved into `groups.include` by profile loading).
+    if !profile.groups.include.is_empty() {
         println!();
         println!("  {}", theme::fg("Security groups:", t.subtext).bold());
-        for g in &profile.security.groups {
+        for g in &profile.groups.include {
             println!("    {}", theme::fg(g, t.text));
         }
     }
 
-    if !profile.security.allowed_commands.is_empty() {
+    if !profile.commands.allow.is_empty() {
         println!();
         println!(
             "  {}",
             theme::fg("Allowed commands (deprecated, startup-only):", t.subtext).bold()
         );
-        for cmd in &profile.security.allowed_commands {
+        for cmd in &profile.commands.allow {
             println!("    {}", theme::fg(cmd, t.text));
         }
     }
@@ -826,7 +894,9 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !fs.write.is_empty()
         || !fs.allow_file.is_empty()
         || !fs.read_file.is_empty()
-        || !fs.write_file.is_empty();
+        || !fs.write_file.is_empty()
+        || !fs.deny.is_empty()
+        || !fs.bypass_protection.is_empty();
 
     if has_fs {
         println!();
@@ -837,44 +907,49 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         print_fs_paths("allow_file (r+w)", &fs.allow_file, t, args.raw);
         print_fs_paths("read_file", &fs.read_file, t, args.raw);
         print_fs_paths("write_file", &fs.write_file, t, args.raw);
+        print_fs_paths("deny", &fs.deny, t, args.raw);
+        if !fs.bypass_protection.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("bypass_protection", t.yellow),
+                fs.bypass_protection.join(", ")
+            );
+        }
     }
 
-    // Policy patches
-    let pp = &profile.policy;
-    let has_policy = !pp.exclude_groups.is_empty()
-        || !pp.add_allow_read.is_empty()
-        || !pp.add_allow_write.is_empty()
-        || !pp.add_allow_readwrite.is_empty()
-        || !pp.add_deny_access.is_empty()
-        || !pp.add_deny_commands.is_empty()
-        || !pp.override_deny.is_empty();
-
-    if has_policy {
+    // Groups/commands (canonical additions)
+    let has_group_settings =
+        !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty();
+    let has_cmd_settings = !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty();
+    if has_group_settings || has_cmd_settings {
         println!();
         println!("  {}", theme::fg("Policy patches:", t.subtext).bold());
-        if !pp.exclude_groups.is_empty() {
+        if !profile.groups.include.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("exclude_groups", t.yellow),
-                pp.exclude_groups.join(", ")
+                theme::fg("groups.include", t.subtext),
+                profile.groups.include.join(", ")
             );
         }
-        print_fs_paths("add_allow_read", &pp.add_allow_read, t, args.raw);
-        print_fs_paths("add_allow_write", &pp.add_allow_write, t, args.raw);
-        print_fs_paths("add_allow_readwrite", &pp.add_allow_readwrite, t, args.raw);
-        print_fs_paths("add_deny_access", &pp.add_deny_access, t, args.raw);
-        if !pp.add_deny_commands.is_empty() {
+        if !profile.groups.exclude.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("add_deny_commands (deprecated, startup-only)", t.yellow),
-                pp.add_deny_commands.join(", ")
+                theme::fg("groups.exclude", t.yellow),
+                profile.groups.exclude.join(", ")
             );
         }
-        if !pp.override_deny.is_empty() {
+        if !profile.commands.allow.is_empty() {
             println!(
                 "    {}: {}",
-                theme::fg("override_deny", t.yellow),
-                pp.override_deny.join(", ")
+                theme::fg("commands.allow", t.subtext),
+                profile.commands.allow.join(", ")
+            );
+        }
+        if !profile.commands.deny.is_empty() {
+            println!(
+                "    {}: {}",
+                theme::fg("commands.deny (deprecated, startup-only)", t.yellow),
+                profile.commands.deny.join(", ")
             );
         }
     }
@@ -1038,29 +1113,49 @@ fn print_fs_paths(label: &str, paths: &[String], t: &theme::Theme, raw: bool) {
     }
 }
 
+#[allow(deprecated)] // reads profile.commands.{allow,deny} (deprecated v0.33.0)
 fn profile_to_json(
-    name: &str,
+    _name: &str,
     profile: &Profile,
     raw_extends: &Option<Vec<String>>,
 ) -> serde_json::Value {
+    // `name` is taken from `profile.meta.name` (resolved at load time) rather
+    // than the invocation argument, so byte-equal comparison between two
+    // fixtures at different paths with the same logical profile works.
     let mut val = serde_json::json!({
-        "name": name,
+        "name": profile.meta.name,
         "description": profile.meta.description.as_deref().unwrap_or(""),
         "extends": raw_extends.as_ref().map(|v| serde_json::json!(v)).unwrap_or(serde_json::Value::Null),
     });
 
-    // Security
-    val["security"] = serde_json::json!({
-        "groups": profile.security.groups,
-        "allowed_commands": profile.security.allowed_commands,
-        "signal_mode": format!("{:?}", profile.security.signal_mode),
-        "process_info_mode": format!("{:?}", profile.security.process_info_mode),
-        "ipc_mode": format!("{:?}", profile.security.ipc_mode),
-        "capability_elevation": profile.security.capability_elevation,
-        "wsl2_proxy_policy": format!("{:?}", profile.security.wsl2_proxy_policy),
-    });
+    // Security — narrow, process-level knobs only. Build via Map so that
+    // Option<…> mode fields are *omitted* when None, matching the shape of
+    // hand-authored profile files (e.g. those produced by users) and the
+    // input schema accepted by `profile validate`. The enum types derive
+    // Serialize with the right rename_all annotations, so values render as
+    // snake_case (`isolated`, `allow_same_sandbox`, …).
+    let mut security = serde_json::Map::new();
+    if let Some(v) = profile.security.signal_mode {
+        security.insert("signal_mode".into(), serde_json::json!(v));
+    }
+    if let Some(v) = profile.security.process_info_mode {
+        security.insert("process_info_mode".into(), serde_json::json!(v));
+    }
+    if let Some(v) = profile.security.ipc_mode {
+        security.insert("ipc_mode".into(), serde_json::json!(v));
+    }
+    security.insert(
+        "capability_elevation".into(),
+        serde_json::json!(profile.security.capability_elevation),
+    );
+    if let Some(v) = profile.security.wsl2_proxy_policy {
+        security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
+    }
+    val["security"] = serde_json::Value::Object(security);
 
-    // Filesystem
+    // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
+    // `bypass_protection`). Legacy keys deserialize into these fields via
+    // `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1068,18 +1163,24 @@ fn profile_to_json(
         "allow_file": profile.filesystem.allow_file,
         "read_file": profile.filesystem.read_file,
         "write_file": profile.filesystem.write_file,
+        "deny": profile.filesystem.deny,
+        "bypass_protection": profile.filesystem.bypass_protection,
     });
 
-    // Policy patches
-    val["policy"] = serde_json::json!({
-        "exclude_groups": profile.policy.exclude_groups,
-        "add_allow_read": profile.policy.add_allow_read,
-        "add_allow_write": profile.policy.add_allow_write,
-        "add_allow_readwrite": profile.policy.add_allow_readwrite,
-        "add_deny_access": profile.policy.add_deny_access,
-        "add_deny_commands": profile.policy.add_deny_commands,
-        "override_deny": profile.policy.override_deny,
-    });
+    // Groups and commands are emitted only when populated, so default-empty
+    // profiles don't carry noise. This matches the canonical input shape.
+    if !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty() {
+        val["groups"] = serde_json::json!({
+            "include": profile.groups.include,
+            "exclude": profile.groups.exclude,
+        });
+    }
+    if !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty() {
+        val["commands"] = serde_json::json!({
+            "allow": profile.commands.allow,
+            "deny": profile.commands.deny,
+        });
+    }
 
     // Network
     val["network"] = serde_json::json!({
@@ -1093,9 +1194,9 @@ fn profile_to_json(
         "upstream_bypass": profile.network.upstream_bypass,
     });
 
-    // Workdir
+    // Workdir. Serde renders WorkdirAccess as lowercase via rename_all.
     val["workdir"] = serde_json::json!({
-        "access": format!("{:?}", profile.workdir.access),
+        "access": profile.workdir.access,
     });
 
     // Rollback
@@ -1157,9 +1258,10 @@ fn profile_to_json(
 // nono profile diff
 // ---------------------------------------------------------------------------
 
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
-    let p1 = profile::load_profile(&args.profile1)?;
-    let p2 = profile::load_profile(&args.profile2)?;
+    let p1 = profile::load_profile_no_migrate(&args.profile1)?;
+    let p2 = profile::load_profile_no_migrate(&args.profile2)?;
 
     if args.json {
         let val = diff_to_json(&args.profile1, &args.profile2, &p1, &p2);
@@ -1178,8 +1280,8 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     let mut any_diff = false;
 
     // Groups
-    let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-    let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+    let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+    let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
     let added_groups: BTreeSet<&&str> = g2.difference(&g1).collect();
     let removed_groups: BTreeSet<&&str> = g1.difference(&g2).collect();
 
@@ -1232,49 +1334,24 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         }
     }
 
-    // Policy patches
+    // Additional filesystem, groups, and commands diffs (formerly grouped
+    // under the legacy `policy.*` patches; now read from their canonical
+    // sections).
     let pp_diffs = diff_string_vecs(&[
+        ("groups.exclude", &p1.groups.exclude, &p2.groups.exclude),
+        ("filesystem.deny", &p1.filesystem.deny, &p2.filesystem.deny),
         (
-            "exclude_groups",
-            &p1.policy.exclude_groups,
-            &p2.policy.exclude_groups,
+            "filesystem.bypass_protection",
+            &p1.filesystem.bypass_protection,
+            &p2.filesystem.bypass_protection,
         ),
-        (
-            "add_allow_read",
-            &p1.policy.add_allow_read,
-            &p2.policy.add_allow_read,
-        ),
-        (
-            "add_allow_write",
-            &p1.policy.add_allow_write,
-            &p2.policy.add_allow_write,
-        ),
-        (
-            "add_allow_readwrite",
-            &p1.policy.add_allow_readwrite,
-            &p2.policy.add_allow_readwrite,
-        ),
-        (
-            "add_deny_access",
-            &p1.policy.add_deny_access,
-            &p2.policy.add_deny_access,
-        ),
-        (
-            "add_deny_commands",
-            &p1.policy.add_deny_commands,
-            &p2.policy.add_deny_commands,
-        ),
-        (
-            "override_deny",
-            &p1.policy.override_deny,
-            &p2.policy.override_deny,
-        ),
+        ("commands.deny", &p1.commands.deny, &p2.commands.deny),
     ]);
 
     if !pp_diffs.is_empty() {
         any_diff = true;
         println!();
-        println!("  {}:", theme::fg("Policy patches", t.subtext).bold());
+        println!("  {}:", theme::fg("Composition", t.subtext).bold());
         for (label, sign, val) in &pp_diffs {
             let color = if *sign == "+" { t.green } else { t.red };
             println!(
@@ -1426,18 +1503,8 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     }
 
     // Allowed commands
-    let cmd1: BTreeSet<&str> = p1
-        .security
-        .allowed_commands
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let cmd2: BTreeSet<&str> = p2
-        .security
-        .allowed_commands
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let cmd1: BTreeSet<&str> = p1.commands.allow.iter().map(|s| s.as_str()).collect();
+    let cmd2: BTreeSet<&str> = p2.commands.allow.iter().map(|s| s.as_str()).collect();
     let added_cmds: BTreeSet<&&str> = cmd2.difference(&cmd1).collect();
     let removed_cmds: BTreeSet<&&str> = cmd1.difference(&cmd2).collect();
 
@@ -1780,9 +1847,10 @@ fn diff_string_vecs<'a>(
     result
 }
 
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_json::Value {
-    let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-    let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+    let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+    let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
 
     let groups_added: Vec<&str> = g2.difference(&g1).copied().collect();
     let groups_removed: Vec<&str> = g1.difference(&g2).copied().collect();
@@ -1805,24 +1873,24 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "added": groups_added,
             "removed": groups_removed,
         },
-        "allowed_commands": diff_vec(
-            &p1.security.allowed_commands,
-            &p2.security.allowed_commands,
-        ),
+        "commands": {
+            "allow": diff_vec(&p1.commands.allow, &p2.commands.allow),
+            "deny": diff_vec(&p1.commands.deny, &p2.commands.deny),
+        },
         "capability_elevation": {
             "profile1": p1.security.capability_elevation,
             "profile2": p2.security.capability_elevation,
             "changed": p1.security.capability_elevation != p2.security.capability_elevation,
         },
         "wsl2_proxy_policy": {
-            "profile1": format!("{:?}", p1.security.wsl2_proxy_policy),
-            "profile2": format!("{:?}", p2.security.wsl2_proxy_policy),
+            "profile1": p1.security.wsl2_proxy_policy,
+            "profile2": p2.security.wsl2_proxy_policy,
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
         },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
         "workdir": {
-            "profile1": format!("{:?}", p1.workdir.access),
-            "profile2": format!("{:?}", p2.workdir.access),
+            "profile1": p1.workdir.access,
+            "profile2": p2.workdir.access,
             "changed": p1.workdir.access != p2.workdir.access,
         },
         "network": {
@@ -2069,13 +2137,58 @@ fn classify_profile_error(e: &NonoError) -> &'static str {
     }
 }
 
+/// Resolve a `nono profile validate` target into a filesystem path.
+///
+/// Clap parses the positional argument as a `PathBuf`, so a user who
+/// types `nono profile validate claude-docs` arrives here with the bare
+/// name. We mirror the same precedence as `--profile`: the literal path
+/// wins if it exists, otherwise look up the user profile dir, then the
+/// installed pack store, then the `.json` form of the bare name. If
+/// nothing matches, return the original input so the existing
+/// not-found error path produces a readable message.
+fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
+    if input.exists() {
+        return input.to_path_buf();
+    }
+    let Some(name) = input.to_str() else {
+        return input.to_path_buf();
+    };
+    if name.contains('/') || name.ends_with(".json") {
+        return input.to_path_buf();
+    }
+    if let Ok(p) = profile::get_user_profile_path(name) {
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(p) = profile::find_pack_store_profile(name) {
+        return p;
+    }
+    input.to_path_buf()
+}
+
 pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let pol = policy::load_embedded_policy()?;
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Step 1: Load profile (parse JSON + resolve inheritance)
-    let profile = match profile::load_profile_from_path(&args.file) {
+    // Resolve the input. Clap parses any bare token as a `PathBuf`, so a
+    // user typing `nono profile validate claude-docs` lands here with
+    // `args.file = PathBuf::from("claude-docs")`. If that doesn't exist as
+    // a file, treat it as a profile name and look it up the same way
+    // `--profile` does.
+    let target_path = resolve_validate_target(&args.file);
+
+    // Step 1: Load profile (parse JSON + resolve inheritance).
+    //
+    // Open a WarningCounterGuard scope around the single parse so each
+    // `emit_deprecation_warning` call triggered inside the legacy drain is
+    // counted. `cmd_validate` only parses once (unlike `cmd_show`, which
+    // invokes `load_profile_extends` then `load_profile`), so the count
+    // matches exactly the number of deprecation lines printed — no
+    // dedupe or state walking required.
+    let guard = crate::deprecation_warnings::WarningCounterGuard::begin();
+    let profile = match profile::load_profile_from_path(&target_path) {
         Ok(p) => Some(p),
         Err(e) => {
             let label = classify_profile_error(&e);
@@ -2083,17 +2196,18 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             None
         }
     };
+    let deprecation_count = guard.finish();
 
     if let Some(ref profile) = profile {
         // Step 2: Check group references
-        for group_name in &profile.security.groups {
+        for group_name in &profile.groups.include {
             if !pol.groups.contains_key(group_name) {
                 errors.push(format!("Group '{}' not found in policy.json", group_name));
             }
         }
 
         // Step 3: Check exclude_groups
-        for excl in &profile.policy.exclude_groups {
+        for excl in &profile.groups.exclude {
             if let Some(group) = pol.groups.get(excl) {
                 if group.required {
                     errors.push(format!("Cannot exclude required group '{}'", excl));
@@ -2121,14 +2235,19 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
     if args.json {
         let val = serde_json::json!({
-            "file": args.file.display().to_string(),
+            "file": target_path.display().to_string(),
             "valid": errors.is_empty(),
             "errors": errors,
             "warnings": warnings,
+            "deprecated_keys": deprecation_count,
         });
         println!("{}", to_json(&val)?);
+        emit_deprecation_summary(deprecation_count);
         if !errors.is_empty() {
             return Err(NonoError::ProfileParse("validation failed".into()));
+        }
+        if args.strict && deprecation_count > 0 {
+            std::process::exit(2);
         }
         return Ok(());
     }
@@ -2137,7 +2256,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     println!(
         "{}: validating {}",
         prefix(),
-        theme::fg(&args.file.display().to_string(), t.text)
+        theme::fg(&target_path.display().to_string(), t.text)
     );
     println!();
 
@@ -2147,12 +2266,12 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
     if let Some(ref profile) = profile {
         let valid_groups = profile
-            .security
             .groups
+            .include
             .iter()
             .filter(|g| pol.groups.contains_key(g.as_str()))
             .count();
-        let total_groups = profile.security.groups.len();
+        let total_groups = profile.groups.include.len();
         if valid_groups == total_groups && total_groups > 0 {
             println!(
                 "  {}  All {} group references valid",
@@ -2190,6 +2309,10 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             theme::fg("valid", t.green).bold(),
             theme::fg(&suffix, t.yellow)
         );
+        emit_deprecation_summary(deprecation_count);
+        if args.strict && deprecation_count > 0 {
+            std::process::exit(2);
+        }
         Ok(())
     } else {
         println!(
@@ -2198,8 +2321,22 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
             errors.len(),
             if errors.len() == 1 { "" } else { "s" }
         );
+        emit_deprecation_summary(deprecation_count);
         Err(NonoError::ProfileParse("validation failed".into()))
     }
+}
+
+/// Print the deprecation summary line to stderr when any legacy keys were
+/// encountered during `cmd_validate`'s parse. No-op when `count == 0` to
+/// keep canonical profiles silent.
+fn emit_deprecation_summary(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "found {count} deprecated keys; run 'nono profile guide' for migration mapping"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,6 +2347,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 ///
 /// This produces a fully-resolved, portable manifest with absolute paths.
 /// Environment variables (`~`, `$HOME`, `$TMPDIR`, etc.) are expanded.
+#[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
 fn resolve_to_manifest(
     prof: &Profile,
     workdir: &std::path::Path,
@@ -2245,21 +2383,6 @@ fn resolve_to_manifest(
             manifest::AccessMode::Write,
             true,
         ),
-        (
-            &prof.policy.add_allow_read,
-            manifest::AccessMode::Read,
-            false,
-        ),
-        (
-            &prof.policy.add_allow_write,
-            manifest::AccessMode::Write,
-            false,
-        ),
-        (
-            &prof.policy.add_allow_readwrite,
-            manifest::AccessMode::Readwrite,
-            false,
-        ),
     ];
 
     for (paths, access, is_file) in fs_sources {
@@ -2267,8 +2390,8 @@ fn resolve_to_manifest(
             grants.push(make_fs_grant(&expand(p)?, *access, *is_file)?);
         }
     }
-    // Deny paths from policy patches
-    for p in &prof.policy.add_deny_access {
+    // Deny paths from canonical `filesystem.deny`
+    for p in &prof.filesystem.deny {
         let expanded = expand(p)?;
         deny.push(manifest::FsDeny {
             path: expanded
@@ -2277,13 +2400,14 @@ fn resolve_to_manifest(
         });
     }
 
-    // Resolve security.groups → filesystem grants, deny paths, and blocked commands.
-    // Groups are the primary source of system read paths, deny rules, and dangerous
-    // command blocks. Without this, the exported manifest is weaker than the profile.
+    // Resolve groups.include → filesystem grants, deny paths, and blocked
+    // commands. Groups are the primary source of system read paths, deny
+    // rules, and dangerous command blocks. Without this, the exported
+    // manifest is weaker than the profile.
     let loaded_policy = policy::load_embedded_policy()?;
     let mut scratch_caps = nono::CapabilitySet::new();
     let resolved_groups =
-        policy::resolve_groups(&loaded_policy, &prof.security.groups, &mut scratch_caps)?;
+        policy::resolve_groups(&loaded_policy, &prof.groups.include, &mut scratch_caps)?;
 
     // Add filesystem grants from resolved groups
     for cap in scratch_caps.fs_capabilities() {
@@ -2296,12 +2420,13 @@ fn resolve_to_manifest(
         grants.push(make_fs_grant(&path_str, access, cap.is_file)?);
     }
 
-    // Expand override_deny paths so we can filter them out of the deny list.
-    // The manifest is the fully-resolved output — overridden denies must not
-    // appear, otherwise the manifest re-applies restrictions the profile relaxed.
-    let override_deny_expanded: Vec<std::path::PathBuf> = prof
-        .policy
-        .override_deny
+    // Expand bypass_protection paths so we can filter them out of the deny
+    // list. The manifest is the fully-resolved output — overridden denies
+    // must not appear, otherwise the manifest re-applies restrictions the
+    // profile relaxed.
+    let bypass_protection_expanded: Vec<std::path::PathBuf> = prof
+        .filesystem
+        .bypass_protection
         .iter()
         .filter_map(|tmpl| profile::expand_vars(tmpl, workdir).ok())
         .map(|p| {
@@ -2314,11 +2439,11 @@ fn resolve_to_manifest(
         .collect();
 
     // Add deny paths from resolved groups, filtering out overridden paths.
-    for deny_path in resolved_groups
-        .deny_paths
-        .iter()
-        .filter(|dp| !override_deny_expanded.iter().any(|ovr| dp.starts_with(ovr)))
-    {
+    for deny_path in resolved_groups.deny_paths.iter().filter(|dp| {
+        !bypass_protection_expanded
+            .iter()
+            .any(|ovr| dp.starts_with(ovr))
+    }) {
         let path_str = deny_path.to_string_lossy().into_owned();
         deny.push(manifest::FsDeny {
             path: path_str
@@ -2444,10 +2569,10 @@ fn resolve_to_manifest(
     };
 
     let process = Some(manifest::Process {
-        allowed_commands: prof.security.allowed_commands.clone(),
+        allowed_commands: prof.commands.allow.clone(),
         blocked_commands: {
             let mut cmds = group_blocked_commands;
-            cmds.extend(prof.policy.add_deny_commands.clone());
+            cmds.extend(prof.commands.deny.clone());
             cmds.sort();
             cmds.dedup();
             cmds
@@ -2660,7 +2785,7 @@ mod tests {
             force: false,
         };
         let skeleton = build_skeleton(&args);
-        let groups = skeleton["security"]["groups"].as_array().expect("array");
+        let groups = skeleton["groups"]["include"].as_array().expect("array");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0], "deny_credentials");
     }
@@ -2802,8 +2927,13 @@ mod tests {
         // Full has more keys than minimal
         assert!(full_obj.len() > minimal_obj.len());
 
-        // Full has sections that minimal does not
-        assert!(full_obj.contains_key("policy"));
+        // Full has sections that minimal does not.
+        // No top-level `policy` key: per #594 the legacy `policy.*` keys
+        // (exclude_groups, add_allow_*, add_deny_*, override_deny) are gone
+        // and their canonical homes are top-level `groups.exclude`,
+        // `commands.deny`, and `filesystem.{deny,bypass_protection,read,write,allow}`.
+        assert!(!full_obj.contains_key("policy"));
+        assert!(full_obj.contains_key("commands"));
         assert!(full_obj.contains_key("network"));
         assert!(full_obj.contains_key("env_credentials"));
         assert!(full_obj.contains_key("hooks"));
@@ -2815,25 +2945,41 @@ mod tests {
         assert!(!full_obj.contains_key("allow_launch_services"));
         assert!(!full_obj.contains_key("allow_gpu"));
 
-        assert!(!minimal_obj.contains_key("policy"));
+        assert!(!minimal_obj.contains_key("commands"));
         assert!(!minimal_obj.contains_key("network"));
         assert!(!minimal_obj.contains_key("hooks"));
 
-        // Full filesystem has all fields
+        // Full filesystem has all canonical fields, including the new
+        // `deny` and `bypass_protection` (canonical replacements for the
+        // legacy `policy` patch — see deprecated_schema.rs).
         let full_fs = full_obj["filesystem"].as_object().expect("fs object");
         assert!(full_fs.contains_key("write"));
         assert!(full_fs.contains_key("allow_file"));
         assert!(full_fs.contains_key("read_file"));
         assert!(full_fs.contains_key("write_file"));
+        assert!(full_fs.contains_key("deny"));
+        assert!(full_fs.contains_key("bypass_protection"));
 
-        // Minimal filesystem has only allow + read
+        // Minimal filesystem has only allow + read; the canonical deny /
+        // bypass_protection appear only with --full.
         let min_fs = minimal_obj["filesystem"].as_object().expect("fs object");
         assert!(!min_fs.contains_key("write"));
         assert!(!min_fs.contains_key("allow_file"));
+        assert!(!min_fs.contains_key("deny"));
+        assert!(!min_fs.contains_key("bypass_protection"));
 
-        // Full policy has add_deny_access
-        let full_pol = full_obj["policy"].as_object().expect("policy object");
-        assert!(full_pol.contains_key("add_deny_access"));
+        // Full groups has both include and exclude; minimal has only include.
+        let full_groups = full_obj["groups"].as_object().expect("groups object");
+        assert!(full_groups.contains_key("include"));
+        assert!(full_groups.contains_key("exclude"));
+        let min_groups = minimal_obj["groups"].as_object().expect("groups object");
+        assert!(min_groups.contains_key("include"));
+        assert!(!min_groups.contains_key("exclude"));
+
+        // Full commands has both allow and deny.
+        let full_cmds = full_obj["commands"].as_object().expect("commands object");
+        assert!(full_cmds.contains_key("allow"));
+        assert!(full_cmds.contains_key("deny"));
 
         // Full network has all fields
         let full_net = full_obj["network"].as_object().expect("network object");
@@ -2842,6 +2988,60 @@ mod tests {
         assert!(full_net.contains_key("open_port"));
         assert!(full_net.contains_key("listen_port"));
         assert!(full_net.contains_key("custom_credentials"));
+    }
+
+    #[test]
+    fn test_full_skeleton_emits_zero_deprecation_warnings() {
+        // The init skeleton is the canonical "how do I write a profile"
+        // entrypoint. It must not teach any deprecated keys; loading it
+        // through the normal Profile parse path must emit zero deprecation
+        // warnings via WarningCounterGuard.
+        use crate::deprecation_warnings::WarningCounterGuard;
+
+        let args = ProfileInitArgs {
+            name: "skeleton-zero-warn".to_string(),
+            extends: Some("default".to_string()),
+            groups: vec![],
+            description: None,
+            full: true,
+            output: None,
+            force: false,
+        };
+        let skeleton = build_skeleton(&args);
+        let json = serde_json::to_string(&skeleton).expect("serialize");
+
+        let guard = WarningCounterGuard::begin();
+        let _profile: Profile = serde_json::from_str(&json).expect("deserialize");
+        let count = guard.finish();
+        assert_eq!(
+            count, 0,
+            "build_skeleton --full produced {count} deprecation warning(s); skeleton must use canonical schema only"
+        );
+    }
+
+    #[test]
+    fn test_minimal_skeleton_emits_zero_deprecation_warnings() {
+        use crate::deprecation_warnings::WarningCounterGuard;
+
+        let args = ProfileInitArgs {
+            name: "skeleton-min-zero-warn".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        };
+        let skeleton = build_skeleton(&args);
+        let json = serde_json::to_string(&skeleton).expect("serialize");
+
+        let guard = WarningCounterGuard::begin();
+        let _profile: Profile = serde_json::from_str(&json).expect("deserialize");
+        let count = guard.finish();
+        assert_eq!(
+            count, 0,
+            "build_skeleton minimal produced {count} deprecation warning(s)"
+        );
     }
 
     #[test]
@@ -2891,36 +3091,35 @@ mod tests {
             "expected 'default' in profiles"
         );
         assert!(
-            profiles.contains(&"claude-code".to_string()),
-            "expected 'claude-code' in profiles"
+            profiles.contains(&"opencode".to_string()),
+            "expected 'codex' in profiles"
         );
     }
 
     #[test]
     fn test_show_resolves_inheritance() {
-        let profile =
-            profile::load_profile("claude-code").expect("claude-code profile should load");
+        let profile = profile::load_profile("opencode").expect("opencode profile should load");
         assert!(
-            !profile.security.groups.is_empty(),
-            "claude-code should have security groups"
+            !profile.groups.include.is_empty(),
+            "opencode should have groups"
         );
-        // claude-code extends default, so it should have default's base groups
-        let has_deny = profile.security.groups.iter().any(|g| g.contains("deny"));
-        assert!(has_deny, "claude-code should inherit deny groups");
+        // opencode extends default, so it should have default's base groups
+        let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
+        assert!(has_deny, "opencode should inherit deny groups");
     }
 
     #[test]
     fn test_diff_shows_differences() {
         let p1 = profile::load_profile("default").expect("default should load");
-        let p2 = profile::load_profile("claude-code").expect("claude-code should load");
+        let p2 = profile::load_profile("opencode").expect("opencode should load");
 
-        let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
-        let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
+        let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
+        let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
 
         let added: BTreeSet<&&str> = g2.difference(&g1).collect();
         assert!(
             !added.is_empty(),
-            "claude-code should have additional groups over default"
+            "codex should have additional groups over default"
         );
     }
 
@@ -2932,7 +3131,7 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test", "description": "test profile" },
-                "security": { "groups": ["deny_credentials"] },
+                "groups": { "include": ["deny_credentials"] },
                 "workdir": { "access": "readwrite" }
             }"#,
         )
@@ -2941,6 +3140,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(result.is_ok(), "valid profile should pass validation");
@@ -2954,7 +3154,7 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test" },
-                "security": { "groups": ["nonexistent_group_xyz"] }
+                "groups": { "include": ["nonexistent_group_xyz"] }
             }"#,
         )
         .expect("write");
@@ -2962,6 +3162,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(result.is_err(), "invalid group should fail validation");
@@ -2975,8 +3176,7 @@ mod tests {
             &path,
             r#"{
                 "meta": { "name": "test" },
-                "security": { "groups": [] },
-                "policy": { "exclude_groups": ["deny_credentials"] }
+                "groups": { "include": [], "exclude": ["deny_credentials"] }
             }"#,
         )
         .expect("write");
@@ -2984,6 +3184,7 @@ mod tests {
         let args = ProfileValidateArgs {
             file: path,
             json: false,
+            strict: false,
         };
         let result = cmd_validate(args);
         assert!(
